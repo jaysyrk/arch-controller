@@ -13,9 +13,10 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qs
 
-from . import __version__, actions, system
-from .auth import COOKIE_NAME, CSRF_HEADER, Auth
+from . import __version__, actions, apps, files, system
+from .auth import COOKIE_NAME, CSRF_HEADER, Auth, PasswordCache
 from .config import Config
 
 log = logging.getLogger("archctl")
@@ -61,6 +62,7 @@ class ControlHandler(BaseHTTPRequestHandler):
     config: Config
     auth: Auth
     router: Router
+    sudo_cache: PasswordCache
 
     # -- plumbing ----------------------------------------------------
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
@@ -86,6 +88,28 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def fail(self, status: int, message: str, extra: dict | None = None) -> None:
         self.send_json({"error": message}, status=status, extra=extra)
+
+    def query(self) -> dict[str, str]:
+        raw = self.path.split("?", 1)[1] if "?" in self.path else ""
+        return {k: v[0] for k, v in parse_qs(raw).items()}
+
+    def send_file(self, path: Path, filename: str) -> None:
+        """Stream a file to the phone without reading it all into memory."""
+        size = path.stat().st_size
+        safe = filename.replace('"', "").replace("\\", "").replace("\n", "")
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as fh:
+            while chunk := fh.read(64 * 1024):
+                self.wfile.write(chunk)
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -245,6 +269,7 @@ def api_login(h: ControlHandler) -> None:
 
 def api_logout(h: ControlHandler) -> None:
     h.auth.drop_session(h.cookie_session())
+    h.sudo_cache.clear()
     expired = f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
     h.send_json({"ok": True}, extra={"Set-Cookie": expired})
 
@@ -261,6 +286,14 @@ def api_status(h: ControlHandler) -> None:
                 {"id": c.id, "label": c.label, "confirm": c.confirm} for c in h.config.commands
             ],
             "shell_enabled": h.config.allow_shell,
+            "sudo": {
+                "enabled": h.config.allow_sudo,
+                "installed": actions.sudo_available(),
+                "passwordless": actions.sudo_passwordless() if h.config.allow_sudo else False,
+                "cached": h.sudo_cache.get() is not None,
+            },
+            "apps_enabled": h.config.apps_enabled,
+            "files_enabled": h.config.files_enabled,
             "version": __version__,
         }
     )
@@ -327,12 +360,8 @@ def api_screenshot(h: ControlHandler) -> None:
 
 
 def api_processes(h: ControlHandler) -> None:
-    query = h.path.split("?", 1)[1] if "?" in h.path else ""
-    limit = 15
-    for pair in query.split("&"):
-        key, _, value = pair.partition("=")
-        if key == "limit" and value.isdigit():
-            limit = int(value)
+    raw_limit = h.query().get("limit", "15")
+    limit = int(raw_limit) if raw_limit.isdigit() else 15
     h.send_json({"processes": actions.processes(limit)})
 
 
@@ -368,6 +397,87 @@ def api_shell(h: ControlHandler) -> None:
     h.send_json(actions.run_shell(script, h.config.shell_timeout))
 
 
+def api_sudo(h: ControlHandler) -> None:
+    if not h.config.allow_sudo:
+        h.fail(403, "sudo is disabled (set actions.allow_sudo = true to enable)")
+        return
+
+    body = h.read_json()
+    script = str(body.get("cmd", ""))
+    password = body.get("password")
+    password = str(password) if password else None
+    log.warning("sudo from %s: %s", h.client_id(), script[:200])
+
+    if password is None:
+        password = h.sudo_cache.get()
+
+    try:
+        result = actions.run_sudo(script, password, timeout=h.config.sudo_timeout)
+    except actions.SudoPasswordRequired:
+        h.send_json({"error": "sudo password required", "needs_password": True}, status=401)
+        return
+
+    if password and body.get("remember", True):
+        h.sudo_cache.store(password)
+    h.send_json({**result, "cmd": script})
+
+
+def api_sudo_forget(h: ControlHandler) -> None:
+    h.sudo_cache.clear()
+    h.send_json({"ok": True})
+
+
+def api_apps(h: ControlHandler) -> None:
+    if not h.config.apps_enabled:
+        h.fail(403, "the app launcher is disabled")
+        return
+    found = apps.list_apps(force=h.query().get("refresh") == "1")
+    query = h.query().get("q", "").strip().lower()
+    if query:
+        found = [a for a in found if query in a["name"].lower() or query in a["comment"].lower()]
+    h.send_json({"apps": [{k: a[k] for k in ("id", "name", "comment", "terminal")} for a in found]})
+
+
+def api_app_launch(h: ControlHandler) -> None:
+    if not h.config.apps_enabled:
+        h.fail(403, "the app launcher is disabled")
+        return
+    body = h.read_json()
+    app_id = str(body.get("id", ""))
+    log.info("launching %s for %s", app_id, h.client_id())
+    h.send_json(apps.launch(app_id))
+
+
+def _files_guard(h: ControlHandler) -> bool:
+    if not h.config.files_enabled:
+        h.fail(403, "file browsing is disabled")
+        return False
+    return True
+
+
+def api_files(h: ControlHandler) -> None:
+    if not _files_guard(h):
+        return
+    query = h.query()
+    show_hidden = query.get("hidden", "1" if h.config.files_show_hidden else "0") == "1"
+    path = query.get("path") or str(h.config.files_root or Path.home())
+    h.send_json(files.listdir(path, show_hidden=show_hidden, root=h.config.files_root))
+
+
+def api_file_open(h: ControlHandler) -> None:
+    if not _files_guard(h):
+        return
+    body = h.read_json()
+    h.send_json(files.open_on_desktop(str(body.get("path", "")), root=h.config.files_root))
+
+
+def api_file_download(h: ControlHandler) -> None:
+    if not _files_guard(h):
+        return
+    target = files.download_target(h.query().get("path", ""), root=h.config.files_root)
+    h.send_file(target, target.name)
+
+
 def build_router() -> Router:
     router = Router()
     router.add("GET", "/api/ping", api_ping)
@@ -387,6 +497,13 @@ def build_router() -> Router:
     router.add("POST", "/api/kill", api_kill)
     router.add("POST", "/api/command", api_command)
     router.add("POST", "/api/shell", api_shell)
+    router.add("POST", "/api/sudo", api_sudo)
+    router.add("POST", "/api/sudo/forget", api_sudo_forget)
+    router.add("GET", "/api/apps", api_apps)
+    router.add("POST", "/api/apps/launch", api_app_launch)
+    router.add("GET", "/api/files", api_files)
+    router.add("POST", "/api/files/open", api_file_open)
+    router.add("GET", "/api/files/download", api_file_download)
     return router
 
 
@@ -398,6 +515,7 @@ class Server(ThreadingHTTPServer):
     def __init__(self, config: Config):
         self.config = config
         self.auth = Auth(token=config.token, session_ttl=config.session_hours * 3600)
+        self.sudo_cache = PasswordCache(ttl=config.sudo_cache_minutes * 60)
         self.router = build_router()
         if ":" in config.host:
             self.address_family = socket.AF_INET6
@@ -405,7 +523,12 @@ class Server(ThreadingHTTPServer):
         handler = type(
             "BoundControlHandler",
             (ControlHandler,),
-            {"config": config, "auth": self.auth, "router": self.router},
+            {
+                "config": config,
+                "auth": self.auth,
+                "router": self.router,
+                "sudo_cache": self.sudo_cache,
+            },
         )
         super().__init__((config.host, config.port), handler)
 

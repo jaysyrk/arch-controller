@@ -7,7 +7,7 @@ import secrets
 import sys
 from pathlib import Path
 
-from . import __version__, actions, config as config_module, server
+from . import __version__, actions, apps, config as config_module, server
 
 
 def cmd_serve(cfg, args) -> int:
@@ -34,12 +34,22 @@ def cmd_url(cfg, args) -> int:
 
 def cmd_check(cfg, args) -> int:
     caps = actions.capabilities()
+    app_list = apps.list_apps() if cfg.apps_enabled else []
     print(f"arch-controller {__version__}")
     print(f"config      {cfg.path or '(defaults, no config file)'}")
     print(f"token file  {cfg.token_file}")
     print(f"listening   {cfg.host}:{cfg.port}")
     print(f"base url    {cfg.base_url}")
     print(f"shell       {'enabled' if cfg.allow_shell else 'disabled'}")
+    if cfg.allow_sudo:
+        mode = "passwordless" if actions.sudo_passwordless() else "will prompt for a password"
+        print(f"sudo        enabled ({mode})")
+    else:
+        print("sudo        disabled — set actions.allow_sudo = true to run root commands")
+    print(f"apps        {'enabled' if cfg.apps_enabled else 'disabled'}"
+          f"{f', {len(app_list)} found' if cfg.apps_enabled else ''}")
+    print(f"files       {'enabled' if cfg.files_enabled else 'disabled'}"
+          f"{f', rooted at {cfg.files_root}' if cfg.files_root else ''}")
     print(f"commands    {len(cfg.commands)} configured")
     print("\nfeature support on this machine:")
     hints = {

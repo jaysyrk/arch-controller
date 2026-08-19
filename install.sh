@@ -31,6 +31,22 @@ else
   info "keeping existing $CONFIG_DIR/config.toml"
 fi
 
+# Running things as root is the main reason most people want this, but it is a
+# real escalation, so make it a deliberate answer rather than a default.
+if grep -q '^allow_sudo = false' "$CONFIG_DIR/config.toml"; then
+  echo
+  warn "enabling sudo means the access token becomes a root login on this machine"
+  read -rp ":: allow running commands as root from your phone? [y/N] " reply
+  if [[ "$reply" =~ ^[Yy] ]]; then
+    sed -i 's/^allow_sudo = false/allow_sudo = true/' "$CONFIG_DIR/config.toml"
+    if sudo -n true 2>/dev/null; then
+      info "sudo enabled — this user already sudoes without a password"
+    else
+      info "sudo enabled — the app will prompt for your password when needed"
+    fi
+  fi
+fi
+
 # Offer the Tailscale address as the bind host — that is the setup that works
 # from another network without opening a single port.
 if command -v tailscale >/dev/null 2>&1; then

@@ -37,6 +37,13 @@ class Config:
     session_hours: int = 720
     allow_shell: bool = False
     shell_timeout: int = 30
+    allow_sudo: bool = False
+    sudo_timeout: int = 120
+    sudo_cache_minutes: int = 5
+    apps_enabled: bool = True
+    files_enabled: bool = True
+    files_root: Path | None = None
+    files_show_hidden: bool = False
     public_url: str = ""
     commands: list[Command] = field(default_factory=list)
     path: Path | None = None
@@ -83,6 +90,18 @@ def load(path: Path | None = None) -> Config:
     actions = data.get("actions", {})
     cfg.allow_shell = bool(actions.get("allow_shell", False))
     cfg.shell_timeout = int(actions.get("shell_timeout", cfg.shell_timeout))
+    cfg.allow_sudo = bool(actions.get("allow_sudo", False))
+    cfg.sudo_timeout = int(actions.get("sudo_timeout", cfg.sudo_timeout))
+    cfg.sudo_cache_minutes = max(0, int(actions.get("sudo_cache_minutes", cfg.sudo_cache_minutes)))
+
+    apps = data.get("apps", {})
+    cfg.apps_enabled = bool(apps.get("enabled", True))
+
+    files = data.get("files", {})
+    cfg.files_enabled = bool(files.get("enabled", True))
+    cfg.files_show_hidden = bool(files.get("show_hidden", False))
+    if files.get("root"):
+        cfg.files_root = Path(os.path.expanduser(str(files["root"]))).resolve()
 
     for raw in data.get("commands", []):
         try:

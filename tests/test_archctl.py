@@ -10,15 +10,22 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from archctl import actions, auth, config as config_module, system  # noqa: E402
+from archctl import actions, apps, auth, config as config_module, files, system  # noqa: E402
 from archctl.server import Server  # noqa: E402
+
+
+def subprocess_result(code: int, stdout: str, stderr: str):
+    """Stand-in for a CompletedProcess, so sudo paths can be tested without root."""
+    return unittest.mock.Mock(returncode=code, stdout=stdout, stderr=stderr)
 
 
 class ConfigTests(unittest.TestCase):
@@ -229,6 +236,186 @@ class ActionParserTests(unittest.TestCase):
         self.assertTrue(all(isinstance(v, bool) for v in caps.values()))
 
 
+class DesktopEntryTests(unittest.TestCase):
+    def test_parses_the_fields_we_show(self) -> None:
+        entry = apps.parse_desktop_entry(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Firefox\n"
+            "Name[de]=Feuerfuchs\n"
+            "Comment=Browse the web\n"
+            "Exec=firefox %u\n"
+            "Categories=Network;WebBrowser;\n"
+            "\n[Desktop Action new-window]\n"
+            "Name=New Window\n"
+        )
+        self.assertEqual(entry["name"], "Firefox")
+        self.assertEqual(entry["comment"], "Browse the web")
+        self.assertEqual(entry["categories"], ["Network", "WebBrowser"])
+        self.assertFalse(entry["terminal"])
+
+    def test_hidden_and_non_application_entries_are_skipped(self) -> None:
+        base = "[Desktop Entry]\nType=Application\nName=X\nExec=x\n"
+        self.assertIsNone(apps.parse_desktop_entry(base + "NoDisplay=true\n"))
+        self.assertIsNone(apps.parse_desktop_entry(base + "Hidden=true\n"))
+        self.assertIsNone(apps.parse_desktop_entry("[Desktop Entry]\nType=Link\nName=X\nExec=x\n"))
+        self.assertIsNone(apps.parse_desktop_entry("[Desktop Entry]\nType=Application\nName=X\n"))
+
+    def test_tryexec_missing_hides_the_entry(self) -> None:
+        entry = "[Desktop Entry]\nType=Application\nName=X\nExec=x\nTryExec=/no/such/binary\n"
+        self.assertIsNone(apps.parse_desktop_entry(entry))
+
+    def test_field_codes_are_stripped_from_exec(self) -> None:
+        self.assertEqual(apps.clean_exec("firefox %u"), ["firefox"])
+        self.assertEqual(apps.clean_exec("code --unity-launch %F"), ["code", "--unity-launch"])
+        self.assertEqual(apps.clean_exec('"/opt/my app/run" %f'), ["/opt/my app/run"])
+        self.assertEqual(apps.clean_exec("thing --file=%f"), ["thing", "--file="])
+
+    def test_terminal_flag(self) -> None:
+        entry = apps.parse_desktop_entry(
+            "[Desktop Entry]\nType=Application\nName=htop\nExec=htop\nTerminal=true\n"
+        )
+        self.assertTrue(entry["terminal"])
+
+    def test_list_apps_is_cached_and_shaped(self) -> None:
+        found = apps.list_apps(force=True)
+        self.assertIsInstance(found, list)
+        for app in found:
+            self.assertTrue(app["id"].endswith(".desktop"))
+            self.assertTrue(app["name"])
+        self.assertIs(apps.list_apps(), apps.list_apps())
+
+    def test_launching_an_unknown_app_404s(self) -> None:
+        with self.assertRaises(actions.ActionError) as ctx:
+            apps.find_app("not-installed.desktop")
+        self.assertEqual(ctx.exception.status, 404)
+
+
+class FileBrowserTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+        (self.root / "sub").mkdir()
+        (self.root / "notes.txt").write_text("hello", encoding="utf-8")
+        (self.root / ".secret").write_text("shh", encoding="utf-8")
+
+    def test_listing_sorts_directories_first(self) -> None:
+        result = files.listdir(str(self.root))
+        names = [e["name"] for e in result["entries"]]
+        self.assertEqual(names, ["sub", "notes.txt"])
+        self.assertTrue(result["entries"][0]["is_dir"])
+        self.assertEqual(result["entries"][1]["size"], 5)
+
+    def test_hidden_files_are_opt_in(self) -> None:
+        visible = [e["name"] for e in files.listdir(str(self.root))["entries"]]
+        self.assertNotIn(".secret", visible)
+        shown = [e["name"] for e in files.listdir(str(self.root), show_hidden=True)["entries"]]
+        self.assertIn(".secret", shown)
+
+    def test_root_confines_navigation(self) -> None:
+        with self.assertRaises(actions.ActionError) as ctx:
+            files.listdir("/etc", root=self.root)
+        self.assertEqual(ctx.exception.status, 403)
+        # Traversal dressed up as a relative path is resolved before the check.
+        with self.assertRaises(actions.ActionError):
+            files.listdir(f"{self.root}/sub/../../..", root=self.root)
+        # And the root itself reports no parent to climb to.
+        self.assertIsNone(files.listdir(str(self.root), root=self.root)["parent"])
+
+    def test_missing_and_non_directory_paths(self) -> None:
+        with self.assertRaises(actions.ActionError) as ctx:
+            files.listdir(str(self.root / "nope"))
+        self.assertEqual(ctx.exception.status, 404)
+        with self.assertRaises(actions.ActionError):
+            files.listdir(str(self.root / "notes.txt"))
+
+    def test_download_target_checks(self) -> None:
+        self.assertEqual(files.download_target(str(self.root / "notes.txt")).name, "notes.txt")
+        with self.assertRaises(actions.ActionError):
+            files.download_target(str(self.root / "sub"))
+
+    def test_broken_symlink_is_listed_not_fatal(self) -> None:
+        (self.root / "dangling").symlink_to(self.root / "gone")
+        names = [e["name"] for e in files.listdir(str(self.root))["entries"]]
+        self.assertIn("dangling", names)
+
+    def test_tilde_expands_to_home(self) -> None:
+        self.assertEqual(files.resolve("~"), Path.home().resolve())
+
+
+class SudoTests(unittest.TestCase):
+    def test_empty_command_rejected(self) -> None:
+        with self.assertRaises(actions.ActionError):
+            actions.run_sudo("   ")
+
+    def test_password_prompt_is_detected(self) -> None:
+        """A sudo that asks for a password surfaces as SudoPasswordRequired."""
+        fake = subprocess_result(1, "", "sudo: a password is required")
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            with self.assertRaises(actions.SudoPasswordRequired):
+                actions.run_sudo("whoami")
+
+    def test_wrong_password_is_reported(self) -> None:
+        fake = subprocess_result(1, "", "Sorry, try again.")
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            with self.assertRaises(actions.ActionError) as ctx:
+                actions.run_sudo("whoami", password="wrong")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertIn("rejected", str(ctx.exception))
+
+    def test_password_is_sent_on_stdin_only(self) -> None:
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["input"] = kwargs.get("input")
+            return subprocess_result(0, "root", "")
+
+        with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            result = actions.run_sudo("id -un", password="hunter2")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["input"], "hunter2\n")
+        self.assertNotIn("hunter2", " ".join(captured["argv"]))
+        self.assertIn("-S", captured["argv"])
+
+    def test_no_password_uses_non_interactive_mode(self) -> None:
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess_result(0, "root", "")
+
+        with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            actions.run_sudo("id -un")
+        self.assertIn("-n", captured["argv"])
+
+    def test_sudo_noise_is_stripped_from_stderr(self) -> None:
+        fake = subprocess_result(0, "done", "sudo: chatter here\nreal warning")
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            result = actions.run_sudo("thing", password="x")
+        self.assertEqual(result["stderr"], "real warning")
+
+
+class PasswordCacheTests(unittest.TestCase):
+    def test_stores_until_expiry(self) -> None:
+        cache = auth.PasswordCache(ttl=100)
+        cache.store("pw", now=0)
+        self.assertEqual(cache.get(now=99), "pw")
+        self.assertIsNone(cache.get(now=101))
+
+    def test_clear_and_zero_ttl(self) -> None:
+        cache = auth.PasswordCache(ttl=100)
+        cache.store("pw", now=0)
+        cache.clear()
+        self.assertIsNone(cache.get(now=1))
+
+        disabled = auth.PasswordCache(ttl=0)
+        disabled.store("pw", now=0)
+        self.assertIsNone(disabled.get(now=0))
+
+
 class ServerTests(unittest.TestCase):
     """End-to-end HTTP tests against a real server on a loopback port."""
 
@@ -401,12 +588,149 @@ class ServerTests(unittest.TestCase):
         self.assertIn("SameSite=Strict", cookie)
         self.assertIn("Path=/", cookie)
 
+    def test_apps_endpoint_lists_and_filters(self) -> None:
+        status, payload = self.bearer("/api/apps")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload["apps"], list)
+        status, filtered = self.bearer("/api/apps?q=zzz-no-such-app")
+        self.assertEqual(status, 200)
+        self.assertEqual(filtered["apps"], [])
+
+    def test_launching_unknown_app_404s(self) -> None:
+        status, _ = self.bearer("/api/apps/launch", "POST", {"id": "nope.desktop"})
+        self.assertEqual(status, 404)
+
+    def test_files_endpoint_browses(self) -> None:
+        status, payload = self.bearer("/api/files?path=/etc")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["path"], "/etc")
+        self.assertEqual(payload["parent"], "/")
+        self.assertTrue(payload["entries"])
+        self.assertTrue(any(p["label"] == "Home" for p in payload["places"]))
+
+    def test_files_endpoint_defaults_to_home(self) -> None:
+        status, payload = self.bearer("/api/files")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["path"], str(Path.home().resolve()))
+
+    def test_file_download_streams_content(self) -> None:
+        target = Path(self.tmp.name) / "hello.txt"
+        target.write_text("streamed", encoding="utf-8")
+        req = urllib.request.Request(
+            self.url(f"/api/files/download?path={urllib.parse.quote(str(target))}"),
+            headers={"Authorization": "Bearer test-token"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            self.assertEqual(response.read(), b"streamed")
+            self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
+
+    def test_downloading_a_directory_404s(self) -> None:
+        status, _ = self.bearer(f"/api/files/download?path={urllib.parse.quote(self.tmp.name)}")
+        self.assertEqual(status, 404)
+
+    def test_sudo_disabled_by_default(self) -> None:
+        status, payload = self.bearer("/api/sudo", "POST", {"cmd": "id"})
+        self.assertEqual(status, 403)
+        self.assertIn("disabled", payload["error"])
+
+    def test_status_reports_new_panels(self) -> None:
+        _, payload = self.bearer("/api/status")
+        self.assertFalse(payload["sudo"]["enabled"])
+        self.assertTrue(payload["apps_enabled"])
+        self.assertTrue(payload["files_enabled"])
+
     def test_repeated_bad_logins_are_throttled(self) -> None:
         # A dedicated Auth instance keeps this from locking out the shared server.
         throttled = auth.Auth(token="x")
         for _ in range(auth.MAX_FAILURES):
             throttled.record_failure("127.0.0.1", now=time.time())
         self.assertGreater(throttled.retry_after("127.0.0.1"), 0)
+
+
+class RestrictedServerTests(unittest.TestCase):
+    """A server with sudo on and the file browser confined to one directory."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name).resolve()
+        (cls.root / "inside.txt").write_text("ok", encoding="utf-8")
+        cfg = config_module.Config(
+            host="127.0.0.1", port=0, token="test-token", token_file=cls.root / "token"
+        )
+        cfg.allow_sudo = True
+        cfg.sudo_cache_minutes = 5
+        cfg.files_root = cls.root
+        cfg.apps_enabled = False
+        cls.server = Server(cfg)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.tmp.cleanup()
+
+    def call(self, path, method="GET", body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method)
+        req.add_header("Authorization", "Bearer test-token")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read())
+
+    def test_file_root_is_enforced_over_http(self) -> None:
+        status, payload = self.call("/api/files")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["path"], str(self.root))
+        self.assertIsNone(payload["parent"])
+
+        status, payload = self.call("/api/files?path=/etc")
+        self.assertEqual(status, 403)
+        self.assertIn("outside", payload["error"])
+
+    def test_download_outside_root_is_refused(self) -> None:
+        status, _ = self.call("/api/files/download?path=/etc/hostname")
+        self.assertEqual(status, 403)
+
+    def test_apps_can_be_switched_off(self) -> None:
+        self.assertEqual(self.call("/api/apps")[0], 403)
+
+    def test_status_reports_sudo_enabled(self) -> None:
+        _, payload = self.call("/api/status")
+        self.assertTrue(payload["sudo"]["enabled"])
+        self.assertIn("passwordless", payload["sudo"])
+        self.assertFalse(payload["apps_enabled"])
+
+    def test_sudo_runs_a_command(self) -> None:
+        """Skipped unless this machine can sudo without a password."""
+        if not actions.sudo_passwordless():
+            self.skipTest("no passwordless sudo available here")
+        status, payload = self.call("/api/sudo", "POST", {"cmd": "id -un"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["stdout"].strip(), "root")
+
+    def test_sudo_password_prompt_surfaces_as_401(self) -> None:
+        fake = subprocess_result(1, "", "sudo: a password is required")
+        with unittest.mock.patch("subprocess.run", return_value=fake):
+            status, payload = self.call("/api/sudo", "POST", {"cmd": "id"})
+        self.assertEqual(status, 401)
+        self.assertTrue(payload["needs_password"])
+
+    def test_password_is_cached_then_forgotten(self) -> None:
+        with unittest.mock.patch("subprocess.run", return_value=subprocess_result(0, "root", "")):
+            self.call("/api/sudo", "POST", {"cmd": "id", "password": "hunter2"})
+        self.assertEqual(self.server.sudo_cache.get(), "hunter2")
+
+        self.assertEqual(self.call("/api/sudo/forget", "POST", {})[0], 200)
+        self.assertIsNone(self.server.sudo_cache.get())
 
 
 if __name__ == "__main__":

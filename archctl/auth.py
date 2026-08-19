@@ -91,3 +91,40 @@ class Auth:
         for sid, expiry in list(self._sessions.items()):
             if expiry <= now:
                 del self._sessions[sid]
+
+
+@dataclass
+class PasswordCache:
+    """Holds a sudo password in memory only, for a bounded window.
+
+    Nothing is written to disk and the value is dropped on logout, on expiry,
+    and whenever the process restarts.
+    """
+
+    ttl: float = 300.0
+    _value: str | None = None
+    _expiry: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def get(self, now: float | None = None) -> str | None:
+        if self.ttl <= 0:
+            return None
+        now = time.time() if now is None else now
+        with self._lock:
+            if self._value is not None and self._expiry > now:
+                return self._value
+            self._value = None
+        return None
+
+    def store(self, password: str, now: float | None = None) -> None:
+        if self.ttl <= 0 or not password:
+            return
+        now = time.time() if now is None else now
+        with self._lock:
+            self._value = password
+            self._expiry = now + self.ttl
+
+    def clear(self) -> None:
+        with self._lock:
+            self._value = None
+            self._expiry = 0.0

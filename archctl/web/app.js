@@ -6,6 +6,12 @@ const $ = (id) => document.getElementById(id);
 let state = null;
 let pollTimer = null;
 let sliderHeld = false;
+let allApps = null;
+let appsInit = false;
+let pendingSudo = null;
+let filesPath = null;
+let filesInit = false;
+let filesHidden = false;
 
 /* ---------- transport ---------- */
 
@@ -29,7 +35,12 @@ async function api(path, options = {}) {
     return response;
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
+  }
   return data;
 }
 
@@ -125,6 +136,16 @@ function render(data) {
     $("brightness-value").textContent = `${data.brightness.percent}%`;
   }
 
+  renderSudo(data.sudo);
+
+  // Load once, not on every poll — and not again if the first attempt failed,
+  // which would toast an error every five seconds.
+  $("apps-card").hidden = !data.apps_enabled;
+  if (data.apps_enabled && !appsInit) { appsInit = true; loadApps(); }
+
+  $("files-card").hidden = !data.files_enabled;
+  if (data.files_enabled && !filesInit) { filesInit = true; loadFiles(); }
+
   renderQuickActions(caps);
 
   $("commands-card").hidden = data.commands.length === 0;
@@ -213,9 +234,24 @@ $("logout").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (event) => {
-  const button = event.target.closest("button[data-media],button[data-volume],button[data-power],button[data-act],button[data-command]");
+  const button = event.target.closest(
+    "button[data-media],button[data-volume],button[data-power],button[data-act]," +
+    "button[data-command],button[data-app],button[data-dir],button[data-file]");
   if (!button) return;
   const set = button.dataset;
+
+  if (set.app) {
+    await guard(post("/api/apps/launch", { id: set.app }), `opening ${button.textContent}`);
+    return;
+  }
+  if (set.dir !== undefined) {
+    loadFiles(set.dir);
+    return;
+  }
+  if (set.file !== undefined) {
+    await guard(post("/api/files/open", { path: set.file }), "opening on the desktop");
+    return;
+  }
 
   if (set.media) {
     const result = await guard(post("/api/media", { action: set.media }));
@@ -316,6 +352,137 @@ $("shell-form").addEventListener("submit", async (event) => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && pollTimer) refresh();
+});
+
+/* ---------- run as root ---------- */
+
+function renderSudo(sudo) {
+  $("sudo-card").hidden = !sudo.enabled;
+  if (!sudo.enabled) return;
+  const badge = $("sudo-state");
+  if (!sudo.installed) badge.textContent = "sudo missing";
+  else if (sudo.passwordless) badge.textContent = "no password needed";
+  else if (sudo.cached) badge.textContent = "unlocked";
+  else badge.textContent = "asks for password";
+  $("sudo-history-row").hidden = !sudo.cached;
+}
+
+async function runSudo(cmd, password) {
+  try {
+    const result = await post("/api/sudo", password ? { cmd, password } : { cmd });
+    $("sudo-auth").hidden = true;
+    $("sudo-password").value = "";
+    pendingSudo = null;
+    showOutput(result);
+    toast(result.ok ? "done" : `exited ${result.code}`, result.ok ? "good" : "bad");
+    refresh();
+  } catch (error) {
+    if (error.payload && error.payload.needs_password) {
+      pendingSudo = cmd;
+      $("sudo-auth").hidden = false;
+      $("sudo-password").focus();
+      return;
+    }
+    if (error.message !== "locked") toast(error.message, "bad");
+  }
+}
+
+$("sudo-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const cmd = $("sudo-input").value.trim();
+  if (cmd) runSudo(cmd, null);
+});
+
+$("sudo-auth-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const password = $("sudo-password").value;
+  if (password && pendingSudo) runSudo(pendingSudo, password);
+});
+
+$("sudo-forget").addEventListener("click", async () => {
+  await guard(post("/api/sudo/forget"), "password forgotten");
+  refresh();
+});
+
+/* ---------- app launcher ---------- */
+
+async function loadApps() {
+  const result = await guard(api("/api/apps"));
+  if (!result) return;
+  allApps = result.apps;
+  $("apps-count").textContent = `${allApps.length}`;
+  renderApps("");
+}
+
+function renderApps(query) {
+  const needle = query.trim().toLowerCase();
+  const matches = needle
+    ? allApps.filter((a) => a.name.toLowerCase().includes(needle) || a.comment.toLowerCase().includes(needle))
+    : allApps;
+  const shown = matches.slice(0, 24);
+  const list = $("apps-list");
+  if (!matches.length) {
+    list.innerHTML = `<p class="muted more">Nothing matches “${escapeHtml(query)}”.</p>`;
+    return;
+  }
+  list.innerHTML =
+    shown.map((a) => `<button data-app="${escapeHtml(a.id)}" title="${escapeHtml(a.comment)}">${escapeHtml(a.name)}</button>`).join("") +
+    (matches.length > shown.length
+      ? `<p class="muted more">${matches.length - shown.length} more — keep typing to narrow it down.</p>`
+      : "");
+}
+
+$("app-search").addEventListener("input", (event) => {
+  if (allApps) renderApps(event.target.value);
+});
+
+/* ---------- file browser ---------- */
+
+async function loadFiles(path) {
+  const params = new URLSearchParams({ hidden: filesHidden ? "1" : "0" });
+  if (path) params.set("path", path);
+  const result = await guard(api(`/api/files?${params}`));
+  if (!result) return;
+  filesPath = result.path;
+  $("file-path").textContent = result.path;
+  $("files-up").disabled = !result.parent;
+  $("files-up").dataset.parent = result.parent || "";
+  $("places").innerHTML = result.places
+    .map((p) => `<button data-dir="${escapeHtml(p.path)}">${escapeHtml(p.label)}</button>`)
+    .join("");
+  renderFiles(result);
+}
+
+function renderFiles(result) {
+  const list = $("file-list");
+  if (!result.entries.length) {
+    list.innerHTML = `<p class="muted">This folder is empty.</p>`;
+    return;
+  }
+  list.innerHTML = result.entries.map((entry) => {
+    const path = escapeHtml(entry.path);
+    if (entry.is_dir) {
+      return `<div class="file"><span class="icon">📁</span>
+        <button class="label" data-dir="${path}">${escapeHtml(entry.name)}</button>
+        <span class="size">›</span></div>`;
+    }
+    const href = `/api/files/download?path=${encodeURIComponent(entry.path)}`;
+    return `<div class="file"><span class="icon">📄</span>
+      <button class="label" data-file="${path}">${escapeHtml(entry.name)}</button>
+      <span class="size">${bytes(entry.size)}</span>
+      <a class="get" href="${href}" download>get</a></div>`;
+  }).join("") + (result.truncated ? `<p class="muted">Showing the first 500 entries.</p>` : "");
+}
+
+$("files-up").addEventListener("click", (event) => {
+  const parent = event.currentTarget.dataset.parent;
+  if (parent) loadFiles(parent);
+});
+
+$("files-hidden").addEventListener("click", (event) => {
+  filesHidden = !filesHidden;
+  event.currentTarget.textContent = filesHidden ? "Hide hidden" : "Show hidden";
+  loadFiles(filesPath);
 });
 
 /* ---------- boot ---------- */

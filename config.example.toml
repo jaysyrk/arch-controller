@@ -26,6 +26,26 @@ session_hours = 720
 allow_shell = false
 shell_timeout = 30
 
+# Run commands as root from the phone. Off by default, because turning it on
+# means the access token is a root login. If sudo asks for a password the app
+# prompts for it, sends it over the connection, and sudo reads it on stdin —
+# it is never written to disk or into a log.
+allow_sudo = false
+sudo_timeout = 120
+# Keep that password in memory for this many minutes so you are not retyping it
+# on every command. 0 asks every single time. Cleared when you log out.
+sudo_cache_minutes = 5
+
+[apps]
+# The launcher, built from .desktop files in the usual XDG directories.
+enabled = true
+
+[files]
+enabled = true
+# Confine browsing to one directory. Unset means anywhere you can read.
+# root = "/home/me"
+show_hidden = false
+
 # Whitelisted buttons. Each runs a fixed argv — no shell, no interpolation —
 # so a stolen token can only trigger exactly what you listed here.
 [[commands]]

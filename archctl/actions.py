@@ -407,3 +407,92 @@ def run_shell(script: str, timeout: int = 30) -> dict:
         stderr=proc.stderr[-20_000:],
         code=proc.returncode,
     ).as_dict()
+
+
+# -- sudo -----------------------------------------------------------------
+
+
+class SudoPasswordRequired(ActionError):
+    """sudo wants a password and none was cached or supplied."""
+
+    def __init__(self) -> None:
+        super().__init__("sudo password required", status=401)
+
+
+PASSWORD_PROMPTS = ("password is required", "no password was provided", "a terminal is required")
+PASSWORD_REJECTED = ("incorrect password", "sorry, try again", "authentication failure")
+
+
+def sudo_available() -> bool:
+    return bool(which("sudo"))
+
+
+def sudo_passwordless() -> bool:
+    """True when this user can sudo without being asked for anything."""
+    if not sudo_available():
+        return False
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _shell_path() -> str:
+    for candidate in (os.environ.get("SHELL"), "/bin/bash", "/bin/sh"):
+        if candidate and Path(candidate).exists():
+            return candidate
+    return "/bin/sh"
+
+
+def run_sudo(script: str, password: str | None = None, timeout: int = 60) -> dict:
+    """Run a command line as root.
+
+    With no password we try the non-interactive path first, so a NOPASSWD
+    sudoers rule or a live sudo timestamp just works. Otherwise the password
+    goes to sudo on stdin and is never written anywhere.
+    """
+    script = (script or "").strip()
+    if not script:
+        raise ActionError("empty command")
+    if not sudo_available():
+        raise ActionError("sudo is not installed", status=501)
+
+    shell = _shell_path()
+    if password:
+        argv = ["sudo", "-S", "-p", "", "--", shell, "-c", script]
+        stdin = password + "\n"
+    else:
+        argv = ["sudo", "-n", "--", shell, "-c", script]
+        stdin = ""
+
+    try:
+        proc = subprocess.run(
+            argv, input=stdin, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise ActionError(f"command timed out after {timeout}s", status=504) from None
+    except OSError as exc:
+        raise ActionError(f"failed to run sudo: {exc}", status=500) from exc
+
+    stderr = proc.stderr
+    lowered = stderr.lower()
+    if proc.returncode != 0:
+        if not password and any(hint in lowered for hint in PASSWORD_PROMPTS):
+            raise SudoPasswordRequired
+        if password and any(hint in lowered for hint in PASSWORD_REJECTED):
+            raise ActionError("sudo rejected that password", status=403)
+
+    # sudo's own prompt/diagnostic noise is not the command's output.
+    cleaned = "\n".join(
+        line for line in stderr.splitlines() if not line.lower().startswith("sudo:")
+    ).strip()
+
+    return Result(
+        ok=proc.returncode == 0,
+        stdout=proc.stdout[-20_000:],
+        stderr=cleaned[-20_000:],
+        code=proc.returncode,
+    ).as_dict()

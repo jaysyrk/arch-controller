@@ -38,6 +38,45 @@
 
   <section class="stats" id="stats"></section>
 
+  <section class="card" id="sudo-card" hidden>
+    <h2>Run as root <span class="badge" id="sudo-state"></span></h2>
+    <form id="sudo-form">
+      <input id="sudo-input" placeholder="pacman -Syu --noconfirm" spellcheck="false"
+             autocapitalize="off" autocorrect="off" enterkeyhint="go">
+      <button type="submit" class="primary">Run</button>
+    </form>
+    <div id="sudo-auth" hidden>
+      <p class="muted">sudo wants your password.</p>
+      <form id="sudo-auth-form">
+        <input id="sudo-password" type="password" placeholder="sudo password"
+               autocomplete="current-password" enterkeyhint="go">
+        <button type="submit" class="primary">Unlock</button>
+      </form>
+    </div>
+    <div class="row" id="sudo-history-row" hidden>
+      <button id="sudo-forget" class="ghost small">Forget password</button>
+    </div>
+  </section>
+
+  <pre id="output" class="output" hidden></pre>
+
+  <section class="card" id="apps-card" hidden>
+    <h2>Open a program <span class="badge" id="apps-count"></span></h2>
+    <input id="app-search" placeholder="Search applications" spellcheck="false"
+           autocapitalize="off" autocorrect="off" enterkeyhint="search">
+    <div class="grid" id="apps-list"></div>
+  </section>
+
+  <section class="card" id="files-card" hidden>
+    <h2>Files <button id="files-hidden" class="ghost small">Show hidden</button></h2>
+    <div class="places" id="places"></div>
+    <div class="crumb">
+      <button id="files-up" class="ghost small" aria-label="Parent directory">↑</button>
+      <span class="path" id="file-path">…</span>
+    </div>
+    <div id="file-list" class="files muted">loading…</div>
+  </section>
+
   <section class="card" id="media-card" hidden>
     <h2>Media</h2>
     <p class="now-playing" id="now-playing">—</p>
@@ -100,7 +139,6 @@
     <div id="processes" class="processes muted">Tap refresh to load.</div>
   </section>
 
-  <pre id="output" class="output" hidden></pre>
   <img id="shot" class="shot" hidden alt="Screenshot of the desktop">
   <footer class="muted" id="footer"></footer>
 </main>
