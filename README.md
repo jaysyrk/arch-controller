@@ -48,21 +48,37 @@ Pure Python standard library. No pip install, no dependencies, no build step.
 
 ## Setup
 
-On the Arch machine:
+Sitting at the Arch machine, paste this:
 
 ```bash
-sudo pacman -S --needed tailscale playerctl brightnessctl wl-clipboard grim libnotify
-sudo systemctl enable --now tailscaled
-sudo tailscale up
-
 git clone https://github.com/jaysyrk/arch-controller.git
 cd arch-controller
+./bootstrap.sh
+```
+
+`bootstrap.sh` takes a machine that has nothing set up and makes it reachable: installs
+Tailscale and brings it up, installs the desktop helpers (picking `grim`/`wl-clipboard`
+on Wayland or `maim`/`xclip` on X11 by looking at your session), then runs `install.sh`.
+It tells you what it's about to do and waits for a yes, skips anything already present,
+and is safe to re-run.
+
+`install.sh` on its own does the second half: writes a config, generates an access token,
+offers to bind the server to your Tailscale address, asks whether to allow root commands,
+installs a systemd **user** service, enables lingering so it survives logout, and prints
+a one-tap login URL.
+
+Doing it by hand instead:
+
+```bash
+sudo pacman -S --needed tailscale playerctl brightnessctl wl-clipboard grim libnotify xdg-utils
+sudo systemctl enable --now tailscaled
+sudo tailscale up
 ./install.sh
 ```
 
-The installer writes a config, generates an access token, offers to bind the server to
-your Tailscale address, installs a systemd **user** service, enables lingering so it
-survives logout, and prints a one-tap login URL.
+**This part has to happen at the machine.** Tailscale sign-in opens a browser, and
+until the box is on a tailnet nothing outside your home network can reach it — including
+Claude Code running elsewhere. There's no way to bootstrap remote access remotely.
 
 On the iPhone: install Tailscale from the App Store, sign in to the same account, open
 that login URL in Safari, then **Share → Add to Home Screen**.
