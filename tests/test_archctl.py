@@ -1,0 +1,413 @@
+"""Tests for arch-controller. Run with: python -m unittest discover -s tests"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.cookiejar import CookieJar
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from archctl import actions, auth, config as config_module, system  # noqa: E402
+from archctl.server import Server  # noqa: E402
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        os.environ.pop("ARCHCTL_TOKEN", None)
+
+    def write_config(self, text: str) -> Path:
+        path = self.dir / "config.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_defaults_when_file_missing(self) -> None:
+        cfg = config_module.load(self.dir / "absent.toml")
+        self.assertEqual(cfg.port, config_module.DEFAULT_PORT)
+        self.assertEqual(cfg.host, "127.0.0.1")
+        self.assertFalse(cfg.allow_shell)
+        self.assertIsNone(cfg.path)
+
+    def test_full_config(self) -> None:
+        path = self.write_config(
+            f"""
+            [server]
+            host = "100.64.0.2"
+            port = 9001
+
+            [auth]
+            token = "hunter2"
+            token_file = "{self.dir / 'tok'}"
+
+            [actions]
+            allow_shell = true
+
+            [[commands]]
+            id = "update"
+            label = "Update system"
+            argv = ["pacman", "-Syu"]
+            confirm = true
+            """
+        )
+        cfg = config_module.load(path)
+        self.assertEqual(cfg.host, "100.64.0.2")
+        self.assertEqual(cfg.port, 9001)
+        self.assertEqual(cfg.token, "hunter2")
+        self.assertTrue(cfg.allow_shell)
+        self.assertEqual(len(cfg.commands), 1)
+        self.assertEqual(cfg.commands[0].argv, ["pacman", "-Syu"])
+        self.assertTrue(cfg.commands[0].confirm)
+        self.assertEqual(cfg.base_url, "http://100.64.0.2:9001")
+        self.assertEqual(cfg.login_url(), "http://100.64.0.2:9001/#t=hunter2")
+
+    def test_env_token_wins(self) -> None:
+        path = self.write_config('[auth]\ntoken = "from-file"\n')
+        os.environ["ARCHCTL_TOKEN"] = "from-env"
+        self.addCleanup(os.environ.pop, "ARCHCTL_TOKEN", None)
+        self.assertEqual(config_module.load(path).token, "from-env")
+
+    def test_command_without_argv_is_rejected(self) -> None:
+        path = self.write_config('[[commands]]\nid = "bad"\nargv = []\n')
+        with self.assertRaises(ValueError):
+            config_module.load(path)
+
+    def test_token_file_is_created_private(self) -> None:
+        target = self.dir / "nested" / "token"
+        token = config_module.read_or_create_token(target)
+        self.assertTrue(target.exists())
+        self.assertGreater(len(token), 20)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(config_module.read_or_create_token(target), token)
+
+    def test_loose_permissions_are_tightened(self) -> None:
+        target = self.dir / "token"
+        target.write_text("plaintext\n", encoding="utf-8")
+        target.chmod(0o644)
+        self.assertEqual(config_module.read_or_create_token(target), "plaintext")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_wildcard_bind_reports_loopback_url(self) -> None:
+        cfg = config_module.Config(host="0.0.0.0", port=8787)
+        self.assertEqual(cfg.base_url, "http://127.0.0.1:8787")
+
+    def test_public_url_overrides(self) -> None:
+        cfg = config_module.Config(public_url="https://arch.tail1234.ts.net/")
+        self.assertEqual(cfg.base_url, "https://arch.tail1234.ts.net")
+
+
+class AuthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.auth = auth.Auth(token="secret", session_ttl=100)
+
+    def test_token_comparison(self) -> None:
+        self.assertTrue(self.auth.check_token("secret"))
+        self.assertFalse(self.auth.check_token("Secret"))
+        self.assertFalse(self.auth.check_token(""))
+        self.assertFalse(auth.Auth(token="").check_token(""))
+
+    def test_session_lifecycle(self) -> None:
+        sid = self.auth.create_session(now=1000)
+        self.assertTrue(self.auth.valid_session(sid, now=1050))
+        self.assertFalse(self.auth.valid_session(sid, now=1101))
+        self.assertFalse(self.auth.valid_session("nope"))
+
+    def test_drop_session(self) -> None:
+        sid = self.auth.create_session()
+        self.auth.drop_session(sid)
+        self.assertFalse(self.auth.valid_session(sid))
+
+    def test_lockout_after_repeated_failures(self) -> None:
+        for _ in range(auth.MAX_FAILURES - 1):
+            self.auth.record_failure("1.2.3.4", now=0)
+        self.assertEqual(self.auth.retry_after("1.2.3.4", now=0), 0.0)
+        self.auth.record_failure("1.2.3.4", now=0)
+        self.assertGreater(self.auth.retry_after("1.2.3.4", now=0), 0)
+        self.assertEqual(self.auth.retry_after("1.2.3.4", now=10_000), 0.0)
+
+    def test_lockout_is_per_client_and_cleared_on_success(self) -> None:
+        for _ in range(auth.MAX_FAILURES):
+            self.auth.record_failure("1.2.3.4", now=0)
+        self.assertEqual(self.auth.retry_after("5.6.7.8", now=0), 0.0)
+        self.auth.record_success("1.2.3.4")
+        self.assertEqual(self.auth.retry_after("1.2.3.4", now=0), 0.0)
+
+
+class SystemParserTests(unittest.TestCase):
+    def test_cpu_line(self) -> None:
+        idle, total = system.parse_cpu_line("cpu  100 0 50 800 20 0 0 0 0 0")
+        self.assertEqual(idle, 820)
+        self.assertEqual(total, 970)
+        self.assertEqual(system.parse_cpu_line("cpu 1 2"), (0, 0))
+
+    def test_meminfo(self) -> None:
+        parsed = system.parse_meminfo("MemTotal:  16384 kB\nMemAvailable: 8192 kB\nBogus: x\n")
+        self.assertEqual(parsed["MemTotal"], 16384 * 1024)
+        self.assertNotIn("Bogus", parsed)
+
+    def test_duration_formatting(self) -> None:
+        self.assertEqual(system.format_duration(90), "1m")
+        self.assertEqual(system.format_duration(3700), "1h 1m")
+        self.assertEqual(system.format_duration(90061), "1d 1h 1m")
+
+    def test_net_dev_skips_loopback(self) -> None:
+        text = (
+            "Inter-|   Receive                          |  Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets\n"
+            "    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n"
+            "  eth0: 500 5 0 0 0 0 0 0 700 7 0 0 0 0 0 0\n"
+        )
+        parsed = system.parse_proc_net_dev(text)
+        self.assertNotIn("lo", parsed)
+        self.assertEqual(parsed["eth0"], (500, 700))
+
+    def test_snapshot_shape(self) -> None:
+        snap = system.snapshot()
+        for key in ("hostname", "uptime", "load", "memory", "disk", "cpu_percent"):
+            self.assertIn(key, snap)
+        self.assertGreater(snap["memory"]["total"], 0)
+
+
+class ActionParserTests(unittest.TestCase):
+    def test_wpctl_volume(self) -> None:
+        self.assertEqual(actions.parse_wpctl_volume("Volume: 0.45"), {"percent": 45, "muted": False})
+        self.assertEqual(
+            actions.parse_wpctl_volume("Volume: 1.00 [MUTED]"), {"percent": 100, "muted": True}
+        )
+
+    def test_pactl_volume(self) -> None:
+        line = "Volume: front-left: 39321 /  60% / -13.32 dB,   front-right: 39321 /  60%"
+        self.assertEqual(actions.parse_pactl_volume(line), 60)
+        self.assertEqual(actions.parse_pactl_volume("nothing here"), 0)
+
+    def test_brightnessctl(self) -> None:
+        self.assertEqual(actions.parse_brightnessctl("intel_backlight,backlight,3980,45%,7500"), 45)
+
+    def test_url_scheme_is_restricted(self) -> None:
+        for bad in ("file:///etc/passwd", "javascript:alert(1)", "", "http://x\nevil"):
+            with self.assertRaises(actions.ActionError):
+                actions.open_url(bad)
+
+    def test_unknown_actions_rejected(self) -> None:
+        with self.assertRaises(actions.ActionError):
+            actions.media("format-disk")
+        with self.assertRaises(actions.ActionError):
+            actions.power("nuke")
+
+    def test_kill_guards(self) -> None:
+        with self.assertRaises(actions.ActionError):
+            actions.kill_process(1)
+        with self.assertRaises(actions.ActionError):
+            actions.kill_process(os.getpid())
+        with self.assertRaises(actions.ActionError):
+            actions.kill_process(999999, "STOP")
+
+    def test_missing_binary_raises_not_implemented(self) -> None:
+        with self.assertRaises(actions.ActionError) as ctx:
+            actions.run(["definitely-not-a-real-binary-xyz"])
+        self.assertEqual(ctx.exception.status, 501)
+
+    def test_processes_reports_this_one(self) -> None:
+        found = actions.processes(limit=100)
+        self.assertTrue(all(p["rss"] >= 0 for p in found))
+        self.assertLessEqual(len(found), 100)
+
+    def test_capabilities_keys(self) -> None:
+        caps = actions.capabilities()
+        self.assertIn("media", caps)
+        self.assertTrue(all(isinstance(v, bool) for v in caps.values()))
+
+
+class ServerTests(unittest.TestCase):
+    """End-to-end HTTP tests against a real server on a loopback port."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cfg = config_module.Config(
+            host="127.0.0.1",
+            port=0,
+            token="test-token",
+            token_file=Path(cls.tmp.name) / "token",
+        )
+        cfg.commands = [
+            config_module.Command(id="echo", label="Echo", argv=["echo", "hello"]),
+        ]
+        cls.server = Server(cfg)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.tmp.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def request(self, path, method="GET", body=None, headers=None, opener=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url(path), data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        fetch = opener.open if opener else urllib.request.urlopen
+        try:
+            with fetch(req, timeout=10) as response:
+                raw = response.read()
+                payload = json.loads(raw) if raw and response.headers.get(
+                    "Content-Type", ""
+                ).startswith("application/json") else raw
+                return response.status, payload
+        except urllib.error.HTTPError as err:
+            raw = err.read()
+            try:
+                return err.code, json.loads(raw)
+            except json.JSONDecodeError:
+                return err.code, raw
+
+    def bearer(self, path, method="GET", body=None):
+        return self.request(path, method, body, {"Authorization": "Bearer test-token"})
+
+    # -- unauthenticated surface ------------------------------------
+    def test_ping_is_public(self) -> None:
+        status, payload = self.request("/api/ping")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["service"], "arch-controller")
+
+    def test_status_requires_auth(self) -> None:
+        status, payload = self.request("/api/status")
+        self.assertEqual(status, 401)
+        self.assertIn("error", payload)
+
+    def test_login_rejects_wrong_token(self) -> None:
+        status, _ = self.request("/api/login", "POST", {"token": "wrong"})
+        self.assertEqual(status, 401)
+
+    def test_unknown_endpoint_404(self) -> None:
+        self.assertEqual(self.bearer("/api/nope")[0], 404)
+
+    def test_method_mismatch_405(self) -> None:
+        self.assertEqual(self.bearer("/api/status", "POST", {})[0], 405)
+
+    def test_static_index_served(self) -> None:
+        with urllib.request.urlopen(self.url("/"), timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("arch-controller", response.read().decode())
+
+    def test_unknown_static_path_404(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.url("/../etc/passwd"), timeout=10)
+        self.assertEqual(ctx.exception.code, 404)
+
+    # -- token auth --------------------------------------------------
+    def test_bearer_token_grants_access(self) -> None:
+        status, payload = self.bearer("/api/status")
+        self.assertEqual(status, 200)
+        self.assertIn("system", payload)
+        self.assertIn("capabilities", payload)
+        self.assertEqual([c["id"] for c in payload["commands"]], ["echo"])
+
+    def test_bad_bearer_token_rejected(self) -> None:
+        status, _ = self.request("/api/status", headers={"Authorization": "Bearer nope"})
+        self.assertEqual(status, 401)
+
+    def test_configured_command_runs(self) -> None:
+        status, payload = self.bearer("/api/command", "POST", {"id": "echo"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["stdout"], "hello")
+
+    def test_unknown_command_404(self) -> None:
+        self.assertEqual(self.bearer("/api/command", "POST", {"id": "rm-rf"})[0], 404)
+
+    def test_shell_disabled_by_default(self) -> None:
+        status, payload = self.bearer("/api/shell", "POST", {"cmd": "id"})
+        self.assertEqual(status, 403)
+        self.assertIn("disabled", payload["error"])
+
+    def test_destructive_power_needs_confirmation(self) -> None:
+        status, payload = self.bearer("/api/power", "POST", {"action": "poweroff"})
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", payload["error"])
+
+    def test_malformed_json_rejected(self) -> None:
+        req = urllib.request.Request(
+            self.url("/api/media"), data=b"{not json", method="POST",
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_processes_endpoint(self) -> None:
+        status, payload = self.bearer("/api/processes?limit=3")
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(payload["processes"]), 3)
+
+    # -- cookie sessions ---------------------------------------------
+    def test_cookie_session_flow_and_csrf(self) -> None:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar())
+        )
+        status, _ = self.request("/api/login", "POST", {"token": "test-token"}, opener=opener)
+        self.assertEqual(status, 200)
+
+        # GET works on the cookie alone.
+        status, payload = self.request("/api/status", opener=opener)
+        self.assertEqual(status, 200)
+        self.assertIn("system", payload)
+
+        # A mutation without the custom header is refused (cross-site defence).
+        status, payload = self.request("/api/media", "POST", {"action": "next"}, opener=opener)
+        self.assertEqual(status, 403)
+        self.assertIn("X-Archctl", payload["error"])
+
+        # With the header it is accepted (501 here only because playerctl is absent).
+        status, _ = self.request(
+            "/api/command", "POST", {"id": "echo"}, {"X-Archctl": "1"}, opener=opener
+        )
+        self.assertEqual(status, 200)
+
+        # Logging out invalidates the session.
+        status, _ = self.request("/api/logout", "POST", {}, {"X-Archctl": "1"}, opener=opener)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request("/api/status", opener=opener)[0], 401)
+
+    def test_session_cookie_is_httponly_and_samesite(self) -> None:
+        req = urllib.request.Request(
+            self.url("/api/login"),
+            data=json.dumps({"token": "test-token"}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+
+    def test_repeated_bad_logins_are_throttled(self) -> None:
+        # A dedicated Auth instance keeps this from locking out the shared server.
+        throttled = auth.Auth(token="x")
+        for _ in range(auth.MAX_FAILURES):
+            throttled.record_failure("127.0.0.1", now=time.time())
+        self.assertGreater(throttled.retry_after("127.0.0.1"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

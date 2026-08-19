@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arch-controller"
+version = "0.1.0"
+description = "Control an Arch Linux machine from your phone, over any network."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+license = { text = "MIT" }
+
+[project.scripts]
+archctl = "archctl.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["archctl*"]
+
+[tool.setuptools.package-data]
+archctl = ["web/*"]

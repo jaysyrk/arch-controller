@@ -1,0 +1,25 @@
+[Unit]
+Description=arch-controller — phone remote for this machine
+Documentation=https://github.com/jaysyrk/arch-controller
+After=graphical-session.target network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__PYTHON__ -m archctl serve
+Restart=on-failure
+RestartSec=3
+# Wait for Tailscale/network to hand out the bind address on boot.
+ExecStartPre=__PYTHON__ -c "import time; time.sleep(2)"
+StandardOutput=journal
+StandardError=journal
+# Keep the service off anything it has no business touching. Not sandboxed
+# harder than this on purpose: it needs your session's audio, display and
+# clipboard sockets to do its job.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Arch">
+<title>arch-controller</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card">
+    <h1>arch-controller</h1>
+    <p class="muted">Paste the access token from <code>archctl token</code>.</p>
+    <input id="token" type="password" inputmode="text" autocomplete="current-password"
+           placeholder="access token" spellcheck="false" autocapitalize="off">
+    <button type="submit" class="primary">Unlock</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</div>
+
+<main id="app" hidden>
+  <header>
+    <div>
+      <h1 id="hostname">…</h1>
+      <p class="muted" id="subtitle">connecting…</p>
+    </div>
+    <button id="logout" class="ghost" aria-label="Log out">Lock</button>
+  </header>
+
+  <section class="stats" id="stats"></section>
+
+  <section class="card" id="media-card" hidden>
+    <h2>Media</h2>
+    <p class="now-playing" id="now-playing">—</p>
+    <div class="row">
+      <button data-media="previous" aria-label="Previous track">⏮</button>
+      <button data-media="play-pause" class="primary" aria-label="Play or pause">⏯</button>
+      <button data-media="next" aria-label="Next track">⏭</button>
+    </div>
+  </section>
+
+  <section class="card" id="volume-card" hidden>
+    <h2>Volume <span class="badge" id="volume-value"></span></h2>
+    <input type="range" id="volume-slider" min="0" max="100" step="1">
+    <div class="row">
+      <button data-volume="down">−</button>
+      <button data-volume="mute">Mute</button>
+      <button data-volume="up">+</button>
+    </div>
+  </section>
+
+  <section class="card" id="brightness-card" hidden>
+    <h2>Brightness <span class="badge" id="brightness-value"></span></h2>
+    <input type="range" id="brightness-slider" min="1" max="100" step="1">
+  </section>
+
+  <section class="card">
+    <h2>Quick actions</h2>
+    <div class="grid" id="quick-actions"></div>
+  </section>
+
+  <section class="card" id="commands-card" hidden>
+    <h2>Commands</h2>
+    <div class="grid" id="commands"></div>
+  </section>
+
+  <section class="card" id="shell-card" hidden>
+    <h2>Shell</h2>
+    <form id="shell-form">
+      <input id="shell-input" placeholder="pacman -Qu" spellcheck="false"
+             autocapitalize="off" autocorrect="off">
+      <button type="submit" class="primary">Run</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Power</h2>
+    <div class="grid">
+      <button data-power="lock">Lock screen</button>
+      <button data-power="suspend">Suspend</button>
+      <button data-power="reboot" class="danger">Reboot</button>
+      <button data-power="poweroff" class="danger">Shut down</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>
+      Top processes
+      <button id="load-processes" class="ghost small">Refresh</button>
+    </h2>
+    <div id="processes" class="processes muted">Tap refresh to load.</div>
+  </section>
+
+  <pre id="output" class="output" hidden></pre>
+  <img id="shot" class="shot" hidden alt="Screenshot of the desktop">
+  <footer class="muted" id="footer"></footer>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

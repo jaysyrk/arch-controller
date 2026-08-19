@@ -1,0 +1,49 @@
+# arch-controller configuration
+# Copy to ~/.config/arch-controller/config.toml and edit.
+
+[server]
+# Bind address. Pick ONE of:
+#   "127.0.0.1"  loopback only — reach it through an SSH tunnel
+#   "100.x.y.z"  your Tailscale IP — reachable from your phone, nothing else (recommended)
+#   "0.0.0.0"    every interface — only do this behind a firewall you trust
+host = "127.0.0.1"
+port = 8787
+
+# Shown by `archctl url`, so the login link you send yourself is the real one.
+# public_url = "https://arch.tailnet-name.ts.net"
+
+[auth]
+# Leave the token out and one is generated in token_file on first run.
+# Read it with `archctl token`, rotate with `archctl token --rotate`.
+# token = "paste-a-long-random-string-here"
+token_file = "~/.config/arch-controller/token"
+
+# How long a phone stays logged in, in hours (30 days by default).
+session_hours = 720
+
+[actions]
+# Off by default: with this on, anyone holding the token gets a shell.
+allow_shell = false
+shell_timeout = 30
+
+# Whitelisted buttons. Each runs a fixed argv — no shell, no interpolation —
+# so a stolen token can only trigger exactly what you listed here.
+[[commands]]
+id = "update-check"
+label = "Check for updates"
+argv = ["checkupdates"]
+
+[[commands]]
+id = "sync-music"
+label = "Sync music"
+argv = ["rsync", "-a", "--delete", "/home/me/Music/", "/mnt/backup/Music/"]
+timeout = 600
+
+# Anything needing root wants a passwordless sudoers line for that exact command:
+#   me ALL=(root) NOPASSWD: /usr/bin/pacman -Syu --noconfirm
+# [[commands]]
+# id = "upgrade"
+# label = "Full system upgrade"
+# argv = ["sudo", "pacman", "-Syu", "--noconfirm"]
+# confirm = true
+# timeout = 1800

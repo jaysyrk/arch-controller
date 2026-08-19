@@ -1,0 +1,14 @@
+{
+  "name": "arch-controller",
+  "short_name": "Arch",
+  "description": "Control an Arch Linux machine from your phone.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
