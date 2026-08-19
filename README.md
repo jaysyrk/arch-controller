@@ -1,6 +1,7 @@
 # arch-controller
 
 Control your Arch Linux machine from your iPhone, from any network.
+**Built with Claude Code!! Not a portfolio project just a useful tool for me**
 
 ## Short answer: yes, this is very doable
 
